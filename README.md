@@ -5,3 +5,9 @@ for STM microcontrollers using rust and embassy
 
 ## Setup
 
+## Run
+
+```
+cargo build --bin jctest
+```
+

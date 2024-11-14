@@ -10,11 +10,12 @@ cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-sing
 cortex-m-rt = "0.7.5"
 defmt = { version = "0.3.8", optional = true }
 defmt-rtt = { version = "0.4.1", optional = true }
-embassy-executor = { version = "0.6.3", features = ["arch-cortex-m", "executor-thread", "integrated-timers"] }
+embassy-executor = { version = "0.6.3", features = ["task-arena-size-32768", "arch-cortex-m", "executor-thread", "defmt", "integrated-timers"] }
 embassy-futures = "0.1.1"
-embassy-stm32 = { version = "0.1.0", features = ["memory-x", "stm32l4s5qi", "time-driver-any", "exti", "unstable-pac"] }
+embassy-stm32 = { version = "0.1.0", features = ["defmt", "memory-x", "stm32l4s5qi", "time-driver-any", "exti", "chrono", "unstable-pac"] }
 embassy-sync = "0.6.0"
-embassy-time = { version = "0.3.2", features = ["tick-hz-32_768"] }
+embassy-time = { version = "0.3.2", features = ["defmt", "defmt-timestamp-uptime","tick-hz-32_768"] }
+heapless = { version = "0.8", default-features = false }
 panic-halt = "1.0.0"
 panic-probe = { version = "0.3.2", features = ["print-defmt"], optional = true }
 

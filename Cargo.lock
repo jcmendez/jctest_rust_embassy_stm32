@@ -61,6 +61,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
+name = "chrono"
+version = "0.4.38"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a21f936df1771bf62b77f047b726c4625ff2e8aa607c01ec06e5a05bd8463401"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "cortex-m"
 version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -269,6 +278,7 @@ dependencies = [
  "bit_field",
  "bxcan",
  "cfg-if",
+ "chrono",
  "cortex-m",
  "cortex-m-rt",
  "critical-section",
@@ -558,6 +568,7 @@ dependencies = [
  "embassy-stm32",
  "embassy-sync 0.6.0",
  "embassy-time",
+ "heapless",
  "panic-halt",
  "panic-probe",
 ]
