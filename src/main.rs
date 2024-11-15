@@ -38,19 +38,24 @@ async fn main(_spawner: Spawner) {
     });
     let p = embassy_stm32::init(config);
     let usart_config = UsartConfig::default();
-    // PB11, PC1 or PA2 could be used as TX pin for LPUART1
     let mut usart = UartTx::new(p.LPUART1, p.PC1, p.DMA1_CH1, usart_config).unwrap();
+    let mut usart2 = UartTx::new(p.USART2, p.PA2, p.DMA1_CH2, usart_config).unwrap();
 
     info!("Hello, World!");
     let button = Input::new(p.PC13, Pull::Up);
-    let mut led = Output::new(p.PC8, Level::High, Speed::Low);
+    let mut green_led = Output::new(p.PF6, Level::High, Speed::Low);
+    let mut blue_led = Output::new(p.PF7, Level::High, Speed::Low);
+    let mut red_led = Output::new(p.PF8, Level::High, Speed::Low);
     let mut rng = Rng::new(p.RNG, Irqs);
     let mut buf = [0u8; 16];
 
+    green_led.set_low();
+    blue_led.set_low();
+    red_led.set_low();
 
     loop {
         if button.is_high() {
-            led.set_high();
+            //led.set_high();
             info!("Button is pressed");
             let start = embassy_time::Instant::now();
             while embassy_time::Instant::now() - start < Duration::from_secs(15) {
@@ -61,10 +66,17 @@ async fn main(_spawner: Spawner) {
                 unwrap!(usart.blocking_write(s.as_bytes()));
                 Timer::after(Duration::from_millis(100)).await;
             }
+            //led.set_low();
         } else {
-            led.set_low();
+            //led.set_low();
             info!("Button is not pressed");
         }
+        info!("Green LED");
+        green_led.set_high();
+        Timer::after(Duration::from_millis(500)).await;
+        green_led.set_low();
         Timer::after(Duration::from_millis(50)).await;
+
+        unwrap!(usart2.blocking_write("ATZ\n".as_bytes()));
     }
 }
