@@ -14,8 +14,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_stm32::{exti::ExtiInput, rcc::{Pll, PllMul, PllPreDiv, PllQDiv, PllRDiv, PllSource}, usart::UartTx};
 use embassy_stm32::rng::Rng;
-use embassy_stm32::usart::Config as UsartConfig;
-use embassy_stm32::{bind_interrupts, peripherals, rng, Config};
+use embassy_stm32::usart::{Config as UsartConfig, Uart};
+use embassy_stm32::{usart, bind_interrupts, peripherals, rng, Config};
 use embassy_stm32::gpio::{Pin, AnyPin, Input, Level, Output, Pull, Speed};
 use embassy_time::{Duration, Timer};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
@@ -31,6 +31,7 @@ static BUFFER_UPDATED: Signal<ThreadModeRawMutex, ()> = Signal::new();
 
 bind_interrupts!(struct Irqs {
     RNG => rng::InterruptHandler<peripherals::RNG>;
+    USART2 => usart::InterruptHandler<peripherals::USART2>;
 });
 
 #[embassy_executor::task]
@@ -77,7 +78,7 @@ async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(config);
     let usart_config = UsartConfig::default();
     let mut usart = UartTx::new(p.LPUART1, p.PC1, p.DMA1_CH1, usart_config).unwrap();
-    let mut usart2 = UartTx::new(p.USART2, p.PA2, p.DMA1_CH2, usart_config).unwrap();
+    let mut usart2 = Uart::new(p.USART2, p.PD6, p.PD5, Irqs, p.DMA1_CH3, p.DMA1_CH4, UsartConfig::default()).unwrap();
 
     info!("Hello, World!");
     let mut button = ExtiInput::new(Input::new(p.PC13, Pull::None), p.EXTI13);
@@ -138,6 +139,7 @@ async fn main(spawner: Spawner) {
         }
         // Publish updated delay value to global context
         BLINK_MS.store(del_var, Ordering::Relaxed);
-        unwrap!(usart2.blocking_write("ATZ\n".as_bytes()));
+        
+        usart2.write("ATZ\n".as_bytes()).await.ok();
     }
 }
