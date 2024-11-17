@@ -16,12 +16,19 @@ use embassy_stm32::{exti::ExtiInput, gpio::OutputOpenDrain, rcc::{Pll, PllMul, P
 use embassy_stm32::usart::{Config as UsartConfig, Uart};
 use embassy_stm32::{usart, bind_interrupts, peripherals, rng, Config};
 use embassy_stm32::gpio::{Pin, AnyPin, Input, Level, Output, Pull, Speed};
+use embassy_stm32::peripherals::{LPUART1,DMA1_CH1, DMA1_CH2, USART3, DMA1_CH5, DMA1_CH6};
 use embassy_time::{Duration, Timer};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_sync::mutex::Mutex;
 use heapless::String;
 use fmt::info;
+
+type LpUart1Type = Mutex<ThreadModeRawMutex, Option<Uart<'static, LPUART1, DMA1_CH1, DMA1_CH2>>>;
+static SHARED_LPUART1: LpUart1Type = Mutex::new(None);
+
+type Uart3Type = Mutex<ThreadModeRawMutex, Option<Uart<'static, USART3, DMA1_CH5, DMA1_CH6>>>;
+static SHARED_USART3: Uart3Type = Mutex::new(None);
 
 // Global variable to store the delay value for blue LED blinking
 static BLINK_MS: AtomicU32 = AtomicU32::new(0);
@@ -30,6 +37,7 @@ static BUFFER_UPDATED: Signal<ThreadModeRawMutex, ()> = Signal::new();
 
 bind_interrupts!(struct Irqs {
     RNG => rng::InterruptHandler<peripherals::RNG>;
+    LPUART1 => usart::InterruptHandler<peripherals::LPUART1>;
     USART2 => usart::InterruptHandler<peripherals::USART2>;
     USART3 => usart::InterruptHandler<peripherals::USART3>;
 });
@@ -70,6 +78,30 @@ async fn red_led_task(led: AnyPin) {
     }
 }
 
+#[embassy_executor::task]
+async fn lpuart1_reader_task() {
+    let mut lpuart1 = SHARED_LPUART1.lock().await;
+    let lpuart1 = lpuart1.as_mut().unwrap();
+    let mut usart3 = SHARED_USART3.lock().await;
+    let usart3 = usart3.as_mut().unwrap();
+    let mut buffer = [0; 1];
+    loop {
+        lpuart1.read(&mut buffer).await.ok();
+        usart3.write(&buffer).await.ok();
+    }
+}
+
+#[embassy_executor::task]
+async fn usart3_reader_task() {
+    let mut usart3 = SHARED_USART3.lock().await;
+    let usart3 = usart3.as_mut().unwrap();
+    let mut buffer = [0; 1];
+    loop {
+        usart3.read(&mut buffer).await.ok();
+        usart3.write(&buffer).await.ok();
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let mut config = Config::default();
@@ -85,9 +117,15 @@ async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(config);
 
     // let usart_config = UsartConfig::default();
-    // let mut usart = UartTx::new(p.LPUART1, p.PC1, p.DMA1_CH1, usart_config).unwrap();
+    let lpuart1 = Uart::new(p.LPUART1, p.PC0, p.PC1, Irqs, p.DMA1_CH1, p.DMA1_CH2, UsartConfig::default()).unwrap();
+    {
+        *(SHARED_LPUART1.lock().await) = Some(lpuart1);
+    }
     // let mut usart2 = Uart::new(p.USART2, p.PD6, p.PD5, Irqs, p.DMA1_CH3, p.DMA1_CH4, UsartConfig::default()).unwrap();
-    let mut usart3 = Uart::new(p.USART3, p.PD9, p.PD8, Irqs, p.DMA1_CH2, p.DMA1_CH5, UsartConfig::default()).unwrap();
+    let usart3 = Uart::new(p.USART3, p.PD9, p.PD8, Irqs, p.DMA1_CH5, p.DMA1_CH6, UsartConfig::default()).unwrap();
+    {
+        *(SHARED_USART3.lock().await) = Some(usart3);
+    }
     let mut sara_reset = OutputOpenDrain::new(p.PD10, Level::High, Speed::Low, Pull::Up);
     let mut sara_power = OutputOpenDrain::new(p.PD13, Level::High, Speed::Low, Pull::None);
 
@@ -113,18 +151,26 @@ async fn main(spawner: Spawner) {
     info!("SARA is powered on and reset");
     Timer::after(Duration::from_millis(200)).await;
 
-    usart3.write("AT&F0\r\n".as_bytes()).await.ok();
-    info!("SARA is reset to factory settings");
-    usart3.write("ATE1\r\n".as_bytes()).await.ok();
-    info!("Echo is enabled");
-    usart3.write("AT+GMM\r\n".as_bytes()).await.ok();
-    info!("SARA firmware version is checked");
+    {
+        let mut usart3 = SHARED_USART3.lock().await;
+        let usart3 = usart3.as_mut().unwrap();
+
+        usart3.write("AT&F0\r\n".as_bytes()).await.ok();
+        info!("SARA is reset to factory settings");
+        usart3.write("ATE1\r\n".as_bytes()).await.ok();
+        info!("Echo is enabled");
+        usart3.write("AT+GMM\r\n".as_bytes()).await.ok();
+        info!("SARA firmware version is checked");
+    }
     // Enable GPS
     // usart3.write("AT+UGPS=1,0,1\r\n".as_bytes()).await.ok();
     // info!("GPS is enabled");
     // usart3.write("AT+CIND?\r\n".as_bytes()).await.ok();
     green_led.set_high();
     set_fast_blink();
+    // Spawn reader tasks
+    spawner.spawn(lpuart1_reader_task()).unwrap();
+    spawner.spawn(usart3_reader_task()).unwrap();
 
     loop {
         button.wait_for_high().await;
