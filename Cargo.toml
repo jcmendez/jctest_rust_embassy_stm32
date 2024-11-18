@@ -15,6 +15,7 @@ embassy-futures = "0.1.1"
 embassy-stm32 = { version = "0.1.0", features = ["defmt", "memory-x", "stm32l4s5qi", "time-driver-any", "exti", "chrono", "unstable-pac"] }
 embassy-sync = "0.6.0"
 embassy-time = { version = "0.3.2", features = ["defmt", "defmt-timestamp-uptime","tick-hz-32_768"] }
+embedded-io = "0.6.1"
 heapless = { version = "0.8", default-features = false }
 panic-halt = "1.0.0"
 panic-probe = { version = "0.3.2", features = ["print-defmt"], optional = true }
