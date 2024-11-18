@@ -119,7 +119,7 @@ async fn modem_to_console_task() {
         let mut lpuart1 = SHARED_LPUART1_TX.lock().await;
         let lpuart1 = lpuart1.as_mut().unwrap();
         lpuart1
-            .write("\033[2JStarting modem to console task\r\n".as_bytes())
+            .write("Starting modem to console task\r\n".as_bytes())
             .ok();
     }
     loop {
@@ -148,21 +148,23 @@ async fn modem_to_console_task() {
 
 #[embassy_executor::task]
 async fn console_to_modem_task() {
-    let mut lpuart1rx = SHARED_LPUART1_RX.lock().await;
-    let mut lpuart1rx = lpuart1rx.as_mut().unwrap();
     loop {
         red_led_off().await;
         trace!("Reading from LPUART1");
-        let mut buf = [0u8; 64];
-        match embedded_io::Read::read(&mut lpuart1rx, &mut buf) {
-            Ok(count) => {
-                red_led_on().await;
-                trace!("Read {}", buf[..count]);
-                let mut usart3tx = SHARED_UART3_TX.lock().await;
-                usart3tx.as_mut().unwrap().write(&buf[..count]).ok();
-            }
-            Err(_) => {
-                info!("Error reading from LPUART1");
+        {
+            let mut lpuart1rx = SHARED_LPUART1_RX.lock().await;
+            let mut lpuart1rx = lpuart1rx.as_mut().unwrap();
+            let mut buf = [0u8; 64];
+            match embedded_io::Read::read(&mut lpuart1rx, &mut buf) {
+                Ok(count) => {
+                    red_led_on().await;
+                    trace!("Read {}", buf[..count]);
+                    let mut usart3tx = SHARED_UART3_TX.lock().await;
+                    usart3tx.as_mut().unwrap().write(&buf[..count]).ok();
+                }
+                Err(_) => {
+                    info!("Error reading from LPUART1");
+                }
             }
         }
         red_led_off().await;
@@ -262,6 +264,7 @@ async fn main(spawner: Spawner) {
     // Spawn LED blinking tasks
     spawner.spawn(blue_led_task()).unwrap();
 
+    // Visual feedback that we are alive
     set_slow_blink();
     sara_power.set_low();
     Timer::after(Duration::from_millis(2200)).await;
@@ -273,12 +276,25 @@ async fn main(spawner: Spawner) {
     info!("SARA is powered on and reset");
     Timer::after(Duration::from_millis(200)).await;
 
-    spawner.spawn(modem_to_console_task()).unwrap();
+    // spawner.spawn(modem_to_console_task()).unwrap();
+    execute_modem_commands().await;
+    // Spawn reader tasks
+    // spawner.spawn(console_to_modem_task()).unwrap();
 
-    // Reset to factory settings
-    send_modem_command("AT&F0\r\n").await;
-    Timer::after(Duration::from_millis(2000)).await;
+    // Visual feedback that we are entering the loop
+    set_fast_blink();
 
+    loop {
+        button.wait_for_high().await;
+        info!("Button pressed");
+        // Set the NMEA messages to RMC (recommended minimum data), at
+        // a rate of 1 per message, sending to the GNSS UART (bitmask 4)
+        send_modem_command("AT+UGNMEA=\"RMC\"\r\n").await;
+        Timer::after(Duration::from_millis(2000)).await;
+    }
+}
+
+async fn execute_modem_commands() {
     // Echo commands
     send_modem_command("ATE1\r\n").await;
     Timer::after(Duration::from_millis(2000)).await;
@@ -303,8 +319,19 @@ async fn main(spawner: Spawner) {
 
     // Turn on the GNSS receiver, with automatic local aiding (1),
     // and using GPS+SBAS+GLONASS (1+2+64)
-    send_modem_command("AT+UGPS=1,1,67\r\n").await;
+    send_modem_command("AT+UGPS=1,1,3\r\n").await;
     Timer::after(Duration::from_millis(2000)).await;
+    // specify format
+    send_modem_command("AT+UGUBX=1\r\n").await;
+    Timer::after(Duration::from_millis(2000)).await;
+    // enable unsolicited result codes
+    send_modem_command("AT+UGIND=1\r\n").await;
+    Timer::after(Duration::from_millis(2000)).await;
+    // configure NMEA output
+    send_modem_command("AT+UGUBX=2,0x06,0x01,0x08,0xF0,0x00,0x01,0x00,0x01,0x01,0x00,0x00,0x00,0x01,0x01\r\n").await;
+    send_modem_command("AT+UGUBX=2,0x06,0x01,0x08,0xF0,0x01,0x01,0x00,0x01,0x01,0x00,0x00,0x00,0x01,0x01\r\n").await;
+    Timer::after(Duration::from_millis(2000)).await;
+
 
     // Return power indicators
     send_modem_command("AT+CIND?\r\n").await;
@@ -316,17 +343,4 @@ async fn main(spawner: Spawner) {
 
     // Return the SIM card status
     send_modem_command("AT+USIMSTAT?\r\n").await;
-    set_fast_blink();
-
-    // Spawn reader tasks
-    spawner.spawn(console_to_modem_task()).unwrap();
-
-    loop {
-        button.wait_for_high().await;
-        info!("Button pressed");
-        // Set the NMEA messages to RMC (recommended minimum data), at
-        // a rate of 1 per message, sending to the GNSS UART (bitmask 4)
-        send_modem_command("AT+UGNMEA=\"RMC\"\r\n").await;
-        Timer::after(Duration::from_millis(2000)).await;
-    }
 }
