@@ -9,18 +9,14 @@ use panic_halt as _;
 use {defmt_rtt as _, panic_probe as _};
 
 use core::sync::atomic::{AtomicU32, Ordering};
-use cortex_m::prelude::{_embedded_hal_blocking_serial_Write, _embedded_hal_serial_Read};
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_stm32::gpio::{AnyPin, Input, Level, Output, Pin, Pull, Speed};
-use embassy_stm32::peripherals::{
-    DMA1_CH1, DMA1_CH2, DMA1_CH5, DMA1_CH6, LPUART1, PF6, PF8, USART3,
-};
+use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
+use embassy_stm32::peripherals::{LPUART1, PF6, PF7, PF8, USART3};
 use embassy_stm32::usart::{
     BufferedInterruptHandler, BufferedUart, BufferedUartRx, BufferedUartTx, Config as UsartConfig,
-    Uart, UartRx, UartTx,
 };
-use embassy_stm32::{bind_interrupts, peripherals, rng, usart, Config};
+use embassy_stm32::{bind_interrupts, peripherals, Config};
 use embassy_stm32::{
     exti::ExtiInput,
     gpio::OutputOpenDrain,
@@ -31,9 +27,9 @@ use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use embedded_io::Write;
 
-type LpUart1TxType = Mutex<CriticalSectionRawMutex, Option<UartTx<'static, LPUART1, DMA1_CH1>>>;
+type LpUart1TxType = Mutex<CriticalSectionRawMutex, Option<BufferedUartTx<'static, LPUART1>>>;
 static SHARED_LPUART1_TX: LpUart1TxType = Mutex::new(None);
-type LpUart1RxType = Mutex<CriticalSectionRawMutex, Option<UartRx<'static, LPUART1, DMA1_CH2>>>;
+type LpUart1RxType = Mutex<CriticalSectionRawMutex, Option<BufferedUartRx<'static, LPUART1>>>;
 static SHARED_LPUART1_RX: LpUart1RxType = Mutex::new(None);
 
 type Uart3TxType = Mutex<CriticalSectionRawMutex, Option<BufferedUartTx<'static, USART3>>>;
@@ -42,7 +38,8 @@ type Uart3RxType = Mutex<CriticalSectionRawMutex, Option<BufferedUartRx<'static,
 static SHARED_UART3_RX: Uart3RxType = Mutex::new(None);
 type RedLedType = Mutex<ThreadModeRawMutex, Option<Output<'static, PF8>>>;
 static SHARED_RED_LED: RedLedType = Mutex::new(None);
-
+type BlueLedType = Mutex<ThreadModeRawMutex, Option<Output<'static, PF7>>>;
+static SHARED_BLUE_LED: BlueLedType = Mutex::new(None);
 type GreenLedType = Mutex<ThreadModeRawMutex, Option<Output<'static, PF6>>>;
 static SHARED_GREEN_LED: GreenLedType = Mutex::new(None);
 
@@ -50,25 +47,29 @@ static SHARED_GREEN_LED: GreenLedType = Mutex::new(None);
 static BLINK_MS: AtomicU32 = AtomicU32::new(0);
 
 // It is ok to use these buffers here by themselves and not in a Mutex because they are
-// only used in conjunction with UART3, which has the
-static mut TX_BUFFER: [u8; 64] = [0; 64];
-static mut RX_BUFFER: [u8; 64] = [0; 64];
+// only used in conjunction with UART1, which has its own Mutex
+static mut UART1_TX_BUFFER: [u8; 64] = [0; 64];
+static mut UART1_RX_BUFFER: [u8; 64] = [0; 64];
+
+// It is ok to use these buffers here by themselves and not in a Mutex because they are
+// only used in conjunction with UART3, which has its own Mutex
+static mut UART3_TX_BUFFER: [u8; 64] = [0; 64];
+static mut UART3_RX_BUFFER: [u8; 64] = [0; 64];
 
 bind_interrupts!(struct Irqs {
-    LPUART1 => usart::InterruptHandler<peripherals::LPUART1>;
-    USART2 => usart::InterruptHandler<peripherals::USART2>;
+    LPUART1 => BufferedInterruptHandler<peripherals::LPUART1>;
+    USART2 => BufferedInterruptHandler<peripherals::USART2>;
     USART3 => BufferedInterruptHandler<peripherals::USART3>;
 });
 
 #[embassy_executor::task]
-async fn blue_led_task(led: AnyPin) {
-    // Configure the LED pin as a push pull output and obtain handler.
-    let mut led = Output::new(led, Level::Low, Speed::Low);
-
+async fn blue_led_task() {
     loop {
         let del = BLINK_MS.load(Ordering::Relaxed);
         Timer::after(Duration::from_millis(del.into())).await;
-        led.toggle();
+        blue_led_on().await;
+        Timer::after(Duration::from_millis(del.into())).await;
+        blue_led_off().await;
     }
 }
 
@@ -100,74 +101,77 @@ async fn green_led_off() {
     green_led.as_mut().unwrap().set_low();
 }
 
-// #[embassy_executor::task]
-// async fn lpuart1_reader_task() {
-//     let mut buffer = [0; 1];
-//     loop {
-//         trace!("Reading from LPUART1");
-//         let mut lpuart1 = SHARED_LPUART1.lock().await;
-//         lpuart1.as_mut().unwrap().read(&mut buffer).await.ok();
-//         red_led_on().await;
-//         trace!("Writing to USART3");
-//         let mut usart3 = SHARED_USART3.lock().await;
-//         usart3.as_mut().unwrap().
-//         red_led_off().await;
-//     }
-// }
+async fn blue_led_on() {
+    let mut blue_led = SHARED_BLUE_LED.lock().await;
+    blue_led.as_mut().unwrap().set_high();
+}
+
+async fn blue_led_off() {
+    let mut blue_led = SHARED_BLUE_LED.lock().await;
+    blue_led.as_mut().unwrap().set_low();
+}
 
 #[embassy_executor::task]
+// This task reads from the modem connected in UART3 and writes to the console connected to LPUART1
+// For visual feedback, it will blink the green LED when it reads from the modem
 async fn modem_to_console_task() {
-    let mut usart3rx = SHARED_UART3_RX.lock().await;
-    let usart3rx = usart3rx.as_mut().unwrap();
     {
         let mut lpuart1 = SHARED_LPUART1_TX.lock().await;
         let lpuart1 = lpuart1.as_mut().unwrap();
         lpuart1
-            .write("Starting modem to console task\r\n".as_bytes())
-            .await
+            .write("\033[2JStarting modem to console task\r\n".as_bytes())
             .ok();
     }
     loop {
         green_led_off().await;
         trace!("Reading from USART3");
-        match usart3rx.read() {
-            Ok(c) => {
-                green_led_on().await;
-                trace!("Read char: {}", c as char);
-                let mut lpuart1 = SHARED_LPUART1_TX.lock().await;
-                let buf = [c];
-                lpuart1.as_mut().unwrap().write(&buf).await.ok();
-            }
-            Err(_) => {
-                info!("Error reading from USART3");
+        {
+            let mut usart3rx = SHARED_UART3_RX.lock().await;
+            let mut usart3rx = usart3rx.as_mut().unwrap();
+            let mut buf = [0u8; 64];
+            match embedded_io::Read::read(&mut usart3rx, &mut buf) {
+                Ok(count) => {
+                    green_led_on().await;
+                    trace!("Read {}", buf[..count]);
+                    let mut lpuart1 = SHARED_LPUART1_TX.lock().await;
+                    lpuart1.as_mut().unwrap().write(&buf[..count]).ok();
+                }
+                Err(_) => {
+                    info!("Error reading from USART3");
+                }
             }
         }
         green_led_off().await;
+        Timer::after(Duration::from_millis(100)).await;
     }
 }
 
 #[embassy_executor::task]
 async fn console_to_modem_task() {
     let mut lpuart1rx = SHARED_LPUART1_RX.lock().await;
-    let lpuart1rx = lpuart1rx.as_mut().unwrap();
+    let mut lpuart1rx = lpuart1rx.as_mut().unwrap();
     loop {
+        red_led_off().await;
         trace!("Reading from LPUART1");
-        let mut buf: [u8; 1] = [0; 1];
-        match lpuart1rx.read(&mut buf).await {
-            Ok(_) => {
-                trace!("Read char: {}", buf[0] as char);
+        let mut buf = [0u8; 64];
+        match embedded_io::Read::read(&mut lpuart1rx, &mut buf) {
+            Ok(count) => {
+                red_led_on().await;
+                trace!("Read {}", buf[..count]);
                 let mut usart3tx = SHARED_UART3_TX.lock().await;
-                usart3tx.as_mut().unwrap().bwrite_all(&buf).ok();
+                usart3tx.as_mut().unwrap().write(&buf[..count]).ok();
             }
             Err(_) => {
                 info!("Error reading from LPUART1");
             }
         }
+        red_led_off().await;
+        Timer::after(Duration::from_millis(100)).await;
     }
 }
 
 async fn send_modem_command(command: &str) {
-    trace!("Trying to send command {}", command);
+    info!("Trying to send command {}", command);
     let mut usart3tx = SHARED_UART3_TX.lock().await;
     let usart3tx = usart3tx.as_mut().unwrap();
     match usart3tx.write_all(command.as_bytes()) {
@@ -178,7 +182,6 @@ async fn send_modem_command(command: &str) {
             info!("Error sending command");
         }
     }
-    usart3tx.bflush().unwrap();
 }
 
 #[embassy_executor::main]
@@ -195,20 +198,22 @@ async fn main(spawner: Spawner) {
     });
     let p = embassy_stm32::init(config);
 
-    let lpuart1 = Uart::new(
-        p.LPUART1,
-        p.PC0,
-        p.PC1,
-        Irqs,
-        p.DMA1_CH1,
-        p.DMA1_CH2,
-        UsartConfig::default(),
-    )
-    .unwrap();
-    let (lpuart1tx, lpuart1rx) = lpuart1.split();
-    {
-        *(SHARED_LPUART1_RX.lock().await) = Some(lpuart1rx);
-        *(SHARED_LPUART1_TX.lock().await) = Some(lpuart1tx);
+    unsafe {
+        let lpuart1 = BufferedUart::new(
+            p.LPUART1,
+            Irqs,
+            p.PC0,
+            p.PC1,
+            UART1_TX_BUFFER.as_mut(),
+            UART1_RX_BUFFER.as_mut(),
+            UsartConfig::default(),
+        )
+        .unwrap();
+        let (lpuart1tx, lpuart1rx) = lpuart1.split();
+        {
+            *(SHARED_LPUART1_RX.lock().await) = Some(lpuart1rx);
+            *(SHARED_LPUART1_TX.lock().await) = Some(lpuart1tx);
+        }
     }
     // let mut usart2 = Uart::new(p.USART2, p.PD6, p.PD5, Irqs, p.DMA1_CH3, p.DMA1_CH4, UsartConfig::default()).unwrap();
 
@@ -220,8 +225,8 @@ async fn main(spawner: Spawner) {
             p.PD8,
             p.PD12,
             p.PD11,
-            &mut TX_BUFFER,
-            &mut RX_BUFFER,
+            UART3_TX_BUFFER.as_mut(),
+            UART3_RX_BUFFER.as_mut(),
             UsartConfig::default(),
         )
         .unwrap();
@@ -233,22 +238,29 @@ async fn main(spawner: Spawner) {
     };
 
     let mut button = ExtiInput::new(Input::new(p.PC13, Pull::None), p.EXTI13);
-    let green_led = Output::new(p.PF6, Level::High, Speed::Low);
-    {
-        *(SHARED_GREEN_LED.lock().await) = Some(green_led);
-    }
-    //let mut blue_led = Output::new(p.PF7, Level::High, Speed::Low);
     let red_led = Output::new(p.PF8, Level::High, Speed::Low);
     {
         *(SHARED_RED_LED.lock().await) = Some(red_led);
     }
+    let blue_led = Output::new(p.PF7, Level::High, Speed::Low);
+    {
+        *(SHARED_BLUE_LED.lock().await) = Some(blue_led);
+    }
+    let green_led = Output::new(p.PF6, Level::High, Speed::Low);
+    {
+        *(SHARED_GREEN_LED.lock().await) = Some(green_led);
+    }
     info!("Hello, World!");
+
+    red_led_off().await;
+    green_led_off().await;
+    blue_led_off().await;
 
     let mut sara_reset = OutputOpenDrain::new(p.PD10, Level::High, Speed::Low, Pull::Up);
     let mut sara_power = OutputOpenDrain::new(p.PD13, Level::High, Speed::Low, Pull::None);
 
     // Spawn LED blinking tasks
-    spawner.spawn(blue_led_task(p.PF7.degrade())).unwrap();
+    spawner.spawn(blue_led_task()).unwrap();
 
     set_slow_blink();
     sara_power.set_low();
@@ -261,8 +273,7 @@ async fn main(spawner: Spawner) {
     info!("SARA is powered on and reset");
     Timer::after(Duration::from_millis(200)).await;
 
-    // spawner.spawn(console_to_modem_task()).unwrap();
-    // spawner.spawn(modem_to_console_task()).unwrap();
+    spawner.spawn(modem_to_console_task()).unwrap();
 
     // Reset to factory settings
     send_modem_command("AT&F0\r\n").await;
@@ -283,7 +294,6 @@ async fn main(spawner: Spawner) {
     // List operator names
     send_modem_command("AT+COPN\r\n").await;
     Timer::after(Duration::from_millis(2000)).await;
-
 
     // Set the SARA UARTS in configuration 4, which is AT instance 1 is
     // UART (5 wire), AT instance 2 not available, diagnostic log is
@@ -307,7 +317,9 @@ async fn main(spawner: Spawner) {
     // Return the SIM card status
     send_modem_command("AT+USIMSTAT?\r\n").await;
     set_fast_blink();
+
     // Spawn reader tasks
+    spawner.spawn(console_to_modem_task()).unwrap();
 
     loop {
         button.wait_for_high().await;
