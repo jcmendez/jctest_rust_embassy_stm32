@@ -24,5 +24,9 @@ PD9 to RX
 PD11 to CTS
 PD12 to RTS
 
+## I2C1 connector
+PB8 to SCL
+PB9 to SDA
+
 ## Buttons
 Button 1 us PC13

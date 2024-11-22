@@ -2,6 +2,7 @@
 #![no_main]
 
 mod fmt;
+mod relay_set;
 
 #[cfg(not(feature = "defmt"))]
 use panic_halt as _;
@@ -12,9 +13,15 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
-use embassy_stm32::peripherals::{DMA1_CH1, DMA1_CH2, DMA2_CH1, DMA2_CH2, LPUART1, PF6, PF7, PF8, USART3};
-use embassy_stm32::usart::{BufferedInterruptHandler, InterruptHandler, Uart, Config as UsartConfig, UartTx, UartRx};
-use embassy_stm32::{bind_interrupts, peripherals, Config};
+use embassy_stm32::i2c::{Config as I2cConfig, I2c};
+use embassy_stm32::peripherals::{
+    DMA1_CH1, DMA1_CH2, DMA2_CH1, DMA2_CH2, LPUART1, PF6, PF7, PF8, USART3,
+};
+use embassy_stm32::time::Hertz;
+use embassy_stm32::usart::{
+    BufferedInterruptHandler, Config as UsartConfig, InterruptHandler, Uart, UartRx, UartTx,
+};
+use embassy_stm32::{bind_interrupts, i2c, peripherals, Config};
 use embassy_stm32::{
     exti::ExtiInput,
     gpio::OutputOpenDrain,
@@ -47,6 +54,8 @@ bind_interrupts!(struct Irqs {
     LPUART1 => InterruptHandler<peripherals::LPUART1>;
     USART2 => BufferedInterruptHandler<peripherals::USART2>;
     USART3 => InterruptHandler<peripherals::USART3>;
+    I2C1_EV => i2c::EventInterruptHandler<peripherals::I2C1>;
+    I2C1_ER => i2c::ErrorInterruptHandler<peripherals::I2C1>;
 });
 
 #[embassy_executor::task]
@@ -104,13 +113,18 @@ async fn blue_led_off() {
 async fn modem_to_console_task() {
     {
         let mut lpuart1tx = SHARED_LPUART1_TX.lock().await;
-        lpuart1tx.as_mut().unwrap().write("Starting modem to console task\r\n".as_bytes()).await.ok();
+        lpuart1tx
+            .as_mut()
+            .unwrap()
+            .write("Starting modem to console task\r\n".as_bytes())
+            .await
+            .ok();
     }
     loop {
         green_led_off().await;
         {
             let mut usart3rx = SHARED_UART3_RX.lock().await;
-            let mut usart3rx = usart3rx.as_mut().unwrap();
+            let usart3rx = usart3rx.as_mut().unwrap();
             match usart3rx.nb_read() {
                 Ok(byte) => {
                     green_led_on().await;
@@ -134,7 +148,12 @@ async fn modem_to_console_task() {
 async fn consume_console_input_task() {
     {
         let mut lpuart1tx = SHARED_LPUART1_TX.lock().await;
-        lpuart1tx.as_mut().unwrap().write("Starting console echo task\r\n".as_bytes()).await.ok();
+        lpuart1tx
+            .as_mut()
+            .unwrap()
+            .write("Starting console echo task\r\n".as_bytes())
+            .await
+            .ok();
     }
 
     loop {
@@ -209,8 +228,8 @@ async fn main(spawner: Spawner) {
         p.PD9, // RX
         p.PD8, // TX
         Irqs,
-        p.PD12, // RTS
-        p.PD11, // CTS
+        p.PD12,     // RTS
+        p.PD11,     // CTS
         p.DMA1_CH1, // DMA1_CH1 is the TX channel for USART3
         p.DMA1_CH2, // DMA1_CH2 is the RX channel for USART3
         UsartConfig::default(),
@@ -236,6 +255,17 @@ async fn main(spawner: Spawner) {
         *(SHARED_GREEN_LED.lock().await) = Some(green_led);
     }
     info!("Hello, World!");
+
+    let mut relays = relay_set::RelaySet::new(I2c::new(
+        p.I2C1,
+        p.PB8,
+        p.PB9,
+        Irqs,
+        p.DMA1_CH3,
+        p.DMA1_CH4,
+        Hertz(100_000),
+        I2cConfig::default(),
+    ));
 
     red_led_off().await;
     green_led_off().await;
@@ -269,9 +299,15 @@ async fn main(spawner: Spawner) {
     // Visual feedback that we are entering the loop
     set_fast_blink();
 
+    let mut current_relay = 0;
+
     loop {
         button.wait_for_high().await;
         info!("Button pressed");
+        red_led_on().await;
+        relays.restart_device(current_relay).await;
+        current_relay = (current_relay + 1) % 4;
+        red_led_off().await;
         // Set the NMEA messages to RMC (recommended minimum data), at
         // a rate of 1 per message, sending to the GNSS UART (bitmask 4)
         send_modem_command("AT+UGNMEA=\"RMC\"\r\n").await;
@@ -313,10 +349,15 @@ async fn execute_modem_commands() {
     send_modem_command("AT+UGIND=1\r\n").await;
     Timer::after(Duration::from_millis(2000)).await;
     // configure NMEA output
-    send_modem_command("AT+UGUBX=2,0x06,0x01,0x08,0xF0,0x00,0x01,0x00,0x01,0x01,0x00,0x00,0x00,0x01,0x01\r\n").await;
-    send_modem_command("AT+UGUBX=2,0x06,0x01,0x08,0xF0,0x01,0x01,0x00,0x01,0x01,0x00,0x00,0x00,0x01,0x01\r\n").await;
+    send_modem_command(
+        "AT+UGUBX=2,0x06,0x01,0x08,0xF0,0x00,0x01,0x00,0x01,0x01,0x00,0x00,0x00,0x01,0x01\r\n",
+    )
+    .await;
+    send_modem_command(
+        "AT+UGUBX=2,0x06,0x01,0x08,0xF0,0x01,0x01,0x00,0x01,0x01,0x00,0x00,0x00,0x01,0x01\r\n",
+    )
+    .await;
     Timer::after(Duration::from_millis(2000)).await;
-
 
     // Return power indicators
     send_modem_command("AT+CIND?\r\n").await;
