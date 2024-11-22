@@ -206,6 +206,8 @@ async fn main(spawner: Spawner) {
     });
     let p = embassy_stm32::init(config);
 
+    //---------------------------------------------------------------------------------------------
+    // Get the LPUART1 an split it in lpuart1tx and lpuart1rx
     let lpuart1 = Uart::new(
         p.LPUART1,
         p.PC0, // RX
@@ -222,6 +224,9 @@ async fn main(spawner: Spawner) {
         *(SHARED_LPUART1_TX.lock().await) = Some(lpuart1tx);
     }
     // let mut usart2 = Uart::new(p.USART2, p.PD6, p.PD5, Irqs, p.DMA1_CH3, p.DMA1_CH4, UsartConfig::default()).unwrap();
+
+    //---------------------------------------------------------------------------------------------
+    // Get the LPUART3 an split it in lpuart3tx and lpuart3rx
 
     let usart3 = Uart::new_with_rtscts(
         p.USART3,
@@ -324,8 +329,20 @@ async fn execute_modem_commands() {
     send_modem_command("AT+GMM\r\n").await;
     Timer::after(Duration::from_millis(2000)).await;
 
+    // Module deregistered from the network but RF circuits are not disabled, hence the
+    // radio synchronization is retained
+    send_modem_command("AT+COPS=2\r\n").await;
+    Timer::after(Duration::from_millis(2000)).await;
+
+    send_modem_command("AT+FUN=1\r\n").await;
+    Timer::after(Duration::from_millis(2000)).await;
+
     // Turn off the module power savings
     send_modem_command("AT+UPSV=0\r\n").await;
+    Timer::after(Duration::from_millis(2000)).await;
+
+    // Read the status of the SARA GPIOs
+    send_modem_command("AT+UGPIOC?\r\n").await;
     Timer::after(Duration::from_millis(2000)).await;
 
     // List operator names
