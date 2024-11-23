@@ -2,6 +2,7 @@
 #![no_main]
 
 mod fmt;
+mod leds;
 mod lte_modem;
 mod relay_set;
 
@@ -10,14 +11,12 @@ use panic_halt as _;
 #[cfg(feature = "defmt")]
 use {defmt_rtt as _, panic_probe as _};
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use crate::leds::Led;
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_stm32::gpio::{Input, Level, Output, Pin, Pull, Speed};
+use embassy_stm32::gpio::{Input, Pin, Pull};
 use embassy_stm32::i2c::{Config as I2cConfig, I2c};
-use embassy_stm32::peripherals::{
-    DMA1_CH1, DMA1_CH2, DMA2_CH1, DMA2_CH2, LPUART1, PF6, PF7, PF8, USART3,
-};
+use embassy_stm32::peripherals::{DMA2_CH1, DMA2_CH2, LPUART1, PF6, PF7, PF8};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::usart::{
     BufferedInterruptHandler, Config as UsartConfig, InterruptHandler, Uart, UartRx, UartTx,
@@ -25,7 +24,6 @@ use embassy_stm32::usart::{
 use embassy_stm32::{bind_interrupts, i2c, peripherals, Config};
 use embassy_stm32::{
     exti::ExtiInput,
-    gpio::OutputOpenDrain,
     rcc::{Pll, PllMul, PllPreDiv, PllQDiv, PllRDiv, PllSource},
 };
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
@@ -37,15 +35,9 @@ static SHARED_LPUART1_TX: LpUart1TxType = Mutex::new(None);
 type LpUart1RxType = Mutex<CriticalSectionRawMutex, Option<UartRx<'static, LPUART1, DMA2_CH2>>>;
 static SHARED_LPUART1_RX: LpUart1RxType = Mutex::new(None);
 // static SHARED_LTE_MODEM: Mutex<ThreadModeRawMutex, Option<lte_modem::LteModem>> = Mutex::new(None);
-type RedLedType = Mutex<ThreadModeRawMutex, Option<Output<'static, PF8>>>;
-static SHARED_RED_LED: RedLedType = Mutex::new(None);
-type BlueLedType = Mutex<ThreadModeRawMutex, Option<Output<'static, PF7>>>;
-static SHARED_BLUE_LED: BlueLedType = Mutex::new(None);
-type GreenLedType = Mutex<ThreadModeRawMutex, Option<Output<'static, PF6>>>;
-static SHARED_GREEN_LED: GreenLedType = Mutex::new(None);
-
-// Global variable to store the delay value for blue LED blinking
-static BLINK_MS: AtomicU32 = AtomicU32::new(0);
+static SHARED_GREEN_LED: Mutex<ThreadModeRawMutex, Option<Led<PF6>>> = Mutex::new(None);
+static SHARED_BLUE_LED: Mutex<ThreadModeRawMutex, Option<Led<PF7>>> = Mutex::new(None);
+static SHARED_RED_LED: Mutex<ThreadModeRawMutex, Option<Led<PF8>>> = Mutex::new(None);
 
 bind_interrupts!(struct Irqs {
     LPUART1 => InterruptHandler<peripherals::LPUART1>;
@@ -56,52 +48,32 @@ bind_interrupts!(struct Irqs {
 });
 
 #[embassy_executor::task]
-async fn blue_led_task() {
-    loop {
-        let del = BLINK_MS.load(Ordering::Relaxed);
-        Timer::after(Duration::from_millis(del.into())).await;
-        blue_led_on().await;
-        Timer::after(Duration::from_millis(del.into())).await;
-        blue_led_off().await;
-    }
+async fn green_led_task() {
+    let mut green_led = SHARED_GREEN_LED.lock().await;
+    let green_led = green_led.as_mut().unwrap();
+    green_led.toggle_task().await;
 }
 
-fn set_fast_blink() {
-    BLINK_MS.store(100, Ordering::Relaxed);
+async fn set_fast_blink() {
+    let mut green_led = SHARED_GREEN_LED.lock().await;
+    let green_led = green_led.as_mut().unwrap();
+    green_led.set_blink_speed(leds::BlinkSpeed::Fast);
 }
 
-fn set_slow_blink() {
-    BLINK_MS.store(1000, Ordering::Relaxed);
+async fn set_slow_blink() {
+    let mut green_led = SHARED_GREEN_LED.lock().await;
+    let green_led = green_led.as_mut().unwrap();
+    green_led.set_blink_speed(leds::BlinkSpeed::Slow);
 }
 
 async fn red_led_on() {
     let mut red_led = SHARED_RED_LED.lock().await;
-    red_led.as_mut().unwrap().set_high();
+    red_led.as_mut().unwrap().on().await;
 }
 
 async fn red_led_off() {
     let mut red_led = SHARED_RED_LED.lock().await;
-    red_led.as_mut().unwrap().set_low();
-}
-
-async fn green_led_on() {
-    let mut green_led = SHARED_GREEN_LED.lock().await;
-    green_led.as_mut().unwrap().set_high();
-}
-
-async fn green_led_off() {
-    let mut green_led = SHARED_GREEN_LED.lock().await;
-    green_led.as_mut().unwrap().set_low();
-}
-
-async fn blue_led_on() {
-    let mut blue_led = SHARED_BLUE_LED.lock().await;
-    blue_led.as_mut().unwrap().set_high();
-}
-
-async fn blue_led_off() {
-    let mut blue_led = SHARED_BLUE_LED.lock().await;
-    blue_led.as_mut().unwrap().set_low();
+    red_led.as_mut().unwrap().off().await;
 }
 
 // #[embassy_executor::task]
@@ -229,17 +201,10 @@ async fn main(spawner: Spawner) {
         lte_modem::LteModem::new(usart3rx, usart3tx, p.PD13.degrade(), p.PD10.degrade());
 
     let mut button = ExtiInput::new(Input::new(p.PC13, Pull::None), p.EXTI13);
-    let red_led = Output::new(p.PF8, Level::High, Speed::Low);
     {
-        *(SHARED_RED_LED.lock().await) = Some(red_led);
-    }
-    let blue_led = Output::new(p.PF7, Level::High, Speed::Low);
-    {
-        *(SHARED_BLUE_LED.lock().await) = Some(blue_led);
-    }
-    let green_led = Output::new(p.PF6, Level::High, Speed::Low);
-    {
-        *(SHARED_GREEN_LED.lock().await) = Some(green_led);
+        *(SHARED_GREEN_LED.lock().await) = Some(Led::new(p.PF6));
+        *(SHARED_BLUE_LED.lock().await) = Some(Led::new(p.PF7));
+        *(SHARED_RED_LED.lock().await) = Some(Led::new(p.PF8));
     }
     info!("Hello, World!");
 
@@ -254,24 +219,20 @@ async fn main(spawner: Spawner) {
         I2cConfig::default(),
     ));
 
-    red_led_off().await;
-    green_led_off().await;
-    blue_led_off().await;
-
     // Spawn LED blinking tasks
-    spawner.spawn(blue_led_task()).unwrap();
+    spawner.spawn(green_led_task()).unwrap();
     // spawner.spawn(consume_console_input_task()).unwrap();
     // spawner.spawn(modem_to_console_task()).unwrap();
 
     // Visual feedback that we are alive
-    set_slow_blink();
+    set_slow_blink().await;
     lte_modem.hardware_reset().await;
     lte_modem.test_commands().await;
     // Spawn reader tasks
     // spawner.spawn(console_to_modem_task()).unwrap();
 
     // Visual feedback that we are entering the loop
-    set_fast_blink();
+    set_fast_blink().await;
 
     let mut current_relay = 0;
 
@@ -281,9 +242,8 @@ async fn main(spawner: Spawner) {
         red_led_on().await;
         relays.restart_device(current_relay).await;
         current_relay = (current_relay + 1) % 4;
+        lte_modem.send_command("AT+UGZDA?", 10000).await.ok();
+        lte_modem.send_command("AT+UGGLL?", 10000).await.ok();
         red_led_off().await;
-        // Set the NMEA messages to RMC (recommended minimum data), at
-        // a rate of 1 per message, sending to the GNSS UART (bitmask 4)
-        lte_modem.send_command("AT+UGNMEA=\"RMC\"", 200).await.ok();
     }
 }

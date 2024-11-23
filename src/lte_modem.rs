@@ -84,14 +84,10 @@ impl LteModem {
             }
             Either::Second(result) => match result {
                 Ok(bytes_read) => {
-                    let bytes_read = bytes_read + 0;
                     let response = &buffer[..bytes_read];
-                    info!("Response: {:?}", response);
-                    if response == b"OK\r\n" {
-                        Ok(())
-                    } else {
-                        Err(AtCommandError)
-                    }
+                    let string_response = core::str::from_utf8(response).ok().unwrap();
+                    info!("Response: {}", string_response);
+                    Ok(())
                 }
                 Err(UartError::Overrun) => {
                     info!("Overrun");
@@ -116,40 +112,68 @@ impl LteModem {
             },
         }
     }
+
+    pub(crate) async fn get_gnss_clock(&mut self) -> Result<(), Error> {
+        self.send_command("AT+UGPSCLCK?", 2000).await.ok();
+        Ok(())
+    }
+
     pub(crate) async fn test_commands(&mut self) {
         info!("Executing startup modem commands");
-        // Echo commands
-
-        self.send_command("ATE1", 2000).await.ok();
+        trace!("Resetting to known state");
+        self.send_command("ATZ", 50).await.ok();
 
         // Print out the modem model
-        self.send_command("AT+GMM", 2000).await.ok();
+        trace!("Printing modem model");
+        self.send_command("AT+GMM", 50).await.ok();
 
         // Module deregistered from the network but RF circuits are not disabled, hence the
         // radio synchronization is retained
-        self.send_command("AT+COPS=2", 2000).await.ok();
+        trace!("Turn on radio, but don't try registering with network");
+        self.send_command("AT+COPS=2", 180_000).await.ok();
 
-        // send_command("AT+FUN=1", 2000).await.ok();
-        // // Turn off the module power savings
-        // send_command("AT+UPSV=0", 2000).await.ok();
-        //
-        // // Read the status of the SARA GPIOs
-        // send_command("AT+UGPIOC?", 2000).await.ok();
-        //
+        trace!("Set MT to full functionality");
+        self.send_command("AT+CFUN=1", 180_000).await.ok();
+        // Turn off the module power savings
+        trace!("Turn off power savings");
+        self.send_command("AT+UPSV=0", 2000).await.ok();
+
+        trace!("Turning on the SARA led");
+        // Set the SARA GPIO 16 to be an output showing the module status
+        self.send_command("AT+UGPIOC=16,10", 10_000).await.ok();
+        //self.send_command("AT+UGPIOC=23,10", 10_000).await.ok();
+        //self.send_command("AT+UGPIOC=24,10", 10_000).await.ok();
+        //self.send_command("AT+UGPIOC=25,10", 10_000).await.ok();
+        //self.send_command("AT+UGPIOC=33,10", 10_000).await.ok();
+        self.send_command("AT+UGPIOC=42,10", 10_000).await.ok();
+        self.send_command("AT+UGPIOC=19,10", 10_000).await.ok();
+        self.send_command("AT+UGPIOC=46,10", 10_000).await.ok();
+
+        // Set the SARA GPIO 23 to be the time pulse output
+        // self.send_command("AT+UGPIOC=23,22", 10_000).await.ok();
+
         // // List operator names
         // send_command("AT+COPN", 2000).await.ok();
-        // // Set the SARA UARTS in configuration 4, which is AT instance 1 is
-        // // UART (5 wire), AT instance 2 not available, diagnostic log is
-        // // USB-NCM, SPI, SDIO, and GNSS tunneling to AUX UART (5 wire)
-        // send_command("AT+USIO=4", 2000).await.ok();
-        //
-        // // Turn on the GNSS receiver, with automatic local aiding (1),
-        // // and using GPS+SBAS+GLONASS (1+2+64)
-        // send_command("AT+UGPS=1,1,3", 2000).await.ok();
-        // // specify format
-        // send_command("AT+UGUBX=1", 2000).await.ok();
-        // // enable unsolicited result codes
-        // send_command("AT+UGIND=1", 2000).await.ok();
+        // Set the SARA UARTS in configuration 4, which is AT instance 1 is
+        // UART (5 wire), AT instance 2 not available, diagnostic log is
+        // USB-NCM, SPI, SDIO, and GNSS tunneling to AUX UART (5 wire)
+        self.send_command("AT+USIO=4", 2000).await.ok();
+
+        // Set the GNSS data go to USB/AUX UART
+        self.send_command("AT+UGPRF=1", 2000).await.ok();
+
+        // Check the current GNSS profile configuration
+        // self.send_command("AT+UGPRF?", 2000).await.ok();
+        // Turn on the GNSS receiver, with automatic local aiding (1),
+        // and using GPS+SBAS+GLONASS (1+2+64)
+        // For now, just GPS + SBAS which is the default
+        self.send_command("AT+UGPS=1,1,3", 2000).await.ok();
+        // enable unsolicited result codes
+        self.send_command("AT+UGIND=1", 2000).await.ok();
+        // enable GNSS time and date output
+        self.send_command("AT+UGZDA=1", 2000).await.ok();
+        // enable GNSS position output
+        self.send_command("AT+UGGLL=1", 2000).await.ok();
         // // configure NMEA output
         // lte_modem
         //         .send_command(
@@ -167,8 +191,10 @@ impl LteModem {
         //         .ok();
         // // Return power indicators
         // send_command("AT+CIND?", 2000).await.ok();
-        // // Return the time based on SARA's clock
-        // send_command("AT+CCLK?", 2000).await.ok();
+        // Return the time based on SARA's clock
+        self.send_command("AT+CCLK?", 2000).await.ok();
+        // List any files
+        self.send_command("AT+ULSTFILE", 2000).await.ok();
         // // Return the SIM card status
         // send_command("AT+USIMSTAT?", 2000).await.ok();
     }
