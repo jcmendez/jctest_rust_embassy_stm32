@@ -14,12 +14,15 @@ embassy-executor = { version = "0.6.3", features = ["task-arena-size-32768", "ar
 embassy-futures = "0.1.1"
 embassy-stm32 = { version = "0.1.0", features = ["defmt", "memory-x", "stm32l4s5qi", "time-driver-any", "exti", "chrono", "unstable-pac"] }
 embassy-sync = "0.6.0"
-embassy-time = { version = "0.3.2", features = ["defmt", "defmt-timestamp-uptime","tick-hz-32_768"] }
+embassy-time = { version = "0.3.2", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
 embedded-io = "0.6.1"
 heapless = { version = "0.8", default-features = false }
 panic-probe = { version = "0.3.2", features = ["print-defmt"], optional = true }
 cortex-m-semihosting = { version = "0.5.0", optional = true }
 log = "0.4.22"
+static_cell = "2.1.0"
+atat = "0.23.0"
+atat_derive = "0.23.0"
 
 [[bin]]
 name = "jctest"

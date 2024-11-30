@@ -3,11 +3,11 @@ use defmt::*;
 use embassy_futures::select::{select, Either};
 use embassy_stm32::gpio::{AnyPin, Level, OutputOpenDrain, Pull, Speed};
 use embassy_stm32::peripherals::{DMA1_CH1, DMA1_CH2, USART3};
-use embassy_stm32::usart::{Error as UartError, UartRx, UartTx};
+use embassy_stm32::usart::{BufferedUartRx, BufferedUartTx, Error as UartError};
 use embassy_time::{Duration, Timer};
 
-type UartTxType = UartTx<'static, USART3, DMA1_CH1>;
-type UartRxType = UartRx<'static, USART3, DMA1_CH2>;
+type UartTxType = BufferedUartTx<'static, USART3>;
+type UartRxType = BufferedUartRx<'static, USART3>;
 
 pub(crate) struct LteModem {
     uart_rx: UartRxType,
@@ -64,53 +64,53 @@ impl LteModem {
         timeout_millis: u32,
     ) -> Result<(), Error> {
         info!("Sending command: {:?}", command);
-        self.uart_tx
-            .write(command.as_bytes())
-            .await
-            .map_err(|_| UartWriteError)?;
-        self.uart_tx
-            .write(b"\r\n")
-            .await
-            .map_err(|_| UartWriteError)?;
-
-        let mut buffer = [0u8; 1024];
-        let timeout = Timer::after(Duration::from_millis(timeout_millis as u64));
-        let read_future = self.uart_rx.read_until_idle(&mut buffer);
-
-        match select(timeout, read_future).await {
-            Either::First(_) => {
-                info!("Timeout");
-                Err(TimeoutError)
-            }
-            Either::Second(result) => match result {
-                Ok(bytes_read) => {
-                    let response = &buffer[..bytes_read];
-                    let string_response = core::str::from_utf8(response).ok().unwrap();
-                    info!("Response: {}", string_response);
-                    Ok(())
-                }
-                Err(UartError::Overrun) => {
-                    info!("Overrun");
-                    Err(UartOverrun)
-                }
-                Err(UartError::Framing) => {
-                    info!("Framing");
-                    Err(UartFraming)
-                }
-                Err(UartError::Noise) => {
-                    info!("Noise");
-                    Err(UartNoise)
-                }
-                Err(UartError::Parity) => {
-                    info!("Parity");
-                    Err(UartParity)
-                }
-                Err(_) => {
-                    info!("UartReadError");
-                    Err(UartReadError)
-                }
-            },
-        }
+        // self.uart_tx
+        //     .write(command.as_bytes())
+        //     .await
+        //     .map_err(|_| UartWriteError)?;
+        // self.uart_tx
+        //     .write(b"\r\n")
+        //     .await
+        //     .map_err(|_| UartWriteError)?;
+        //
+        // let mut buffer = [0u8; 1024];
+        // let timeout = Timer::after(Duration::from_millis(timeout_millis as u64));
+        // let read_future = self.uart_rx.read_until_idle(&mut buffer);
+        //
+        // match select(timeout, read_future).await {
+        //     Either::First(_) => {
+        //         info!("Timeout");
+        //         Err(TimeoutError)
+        //     }
+        //     Either::Second(result) => match result {
+        //         Ok(bytes_read) => {
+        //             let response = &buffer[..bytes_read];
+        //             let string_response = core::str::from_utf8(response).ok().unwrap();
+        //             info!("Response: {}", string_response);
+        //             Ok(())
+        //         }
+        //         Err(UartError::Overrun) => {
+        //             info!("Overrun");
+        //             Err(UartOverrun)
+        //         }
+        //         Err(UartError::Framing) => {
+        //             info!("Framing");
+        //             Err(UartFraming)
+        //         }
+        //         Err(UartError::Noise) => {
+        //             info!("Noise");
+        //             Err(UartNoise)
+        //         }
+        //         Err(UartError::Parity) => {
+        //             info!("Parity");
+        //             Err(UartParity)
+        //         }
+        //         Err(_) => {
+        //             info!("UartReadError");
+        //             Err(UartReadError)
+        //         }
+        //     },
+        Ok(())
     }
 
     pub(crate) async fn get_gnss_clock(&mut self) -> Result<(), Error> {
