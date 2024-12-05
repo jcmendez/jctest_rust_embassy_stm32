@@ -6,19 +6,14 @@ mod leds;
 mod lte_modem;
 mod relay_set;
 
+use core::ptr::addr_of_mut;
 #[cfg(not(feature = "defmt"))]
 use panic_halt as _;
 #[cfg(feature = "defmt")]
 use {defmt_rtt as _, panic_probe as _};
 
 use crate::leds::Led;
-use atat::heapless::String;
-use atat::{
-    asynch::{AtatClient, Client},
-    AtatIngress, DefaultDigester, Ingress, ResponseSlot, UrcChannel,
-};
-use atat_derive::{AtatResp, AtatUrc};
-use defmt::panic;
+use atat::AtatIngress;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_stm32::gpio::{Input, Pin, Pull};
@@ -26,7 +21,7 @@ use embassy_stm32::i2c::{Config as I2cConfig, I2c};
 use embassy_stm32::peripherals::{DMA2_CH1, DMA2_CH2, LPUART1, PF6, PF7, PF8};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::usart::{
-    BufferedInterruptHandler, BufferedUart, BufferedUartRx, Config as UsartConfig,
+    BufferedInterruptHandler, BufferedUart, BufferedUartRx, BufferedUartTx, Config as UsartConfig,
     InterruptHandler, Uart, UartRx, UartTx,
 };
 use embassy_stm32::{bind_interrupts, i2c, peripherals, Config};
@@ -36,7 +31,7 @@ use embassy_stm32::{
 };
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Delay, Duration, Timer};
 use static_cell::StaticCell;
 
 type LpUart1TxType = Mutex<CriticalSectionRawMutex, Option<UartTx<'static, LPUART1, DMA2_CH1>>>;
@@ -44,39 +39,21 @@ static SHARED_LPUART1_TX: LpUart1TxType = Mutex::new(None);
 type LpUart1RxType = Mutex<CriticalSectionRawMutex, Option<UartRx<'static, LPUART1, DMA2_CH2>>>;
 static SHARED_LPUART1_RX: LpUart1RxType = Mutex::new(None);
 
-// static SHARED_LTE_MODEM: Mutex<ThreadModeRawMutex, Option<lte_modem::LteModem>> = Mutex::new(None);
+type Uart3RxType =
+    Mutex<CriticalSectionRawMutex, Option<BufferedUartRx<'static, peripherals::USART3>>>;
+static SHARED_UART3_RX: Uart3RxType = Mutex::new(None);
+
+static SHARED_LTE_MODEM: Mutex<ThreadModeRawMutex, Option<lte_modem::LteModem>> = Mutex::new(None);
 static SHARED_GREEN_LED: Mutex<ThreadModeRawMutex, Option<Led<PF6>>> = Mutex::new(None);
 static SHARED_BLUE_LED: Mutex<ThreadModeRawMutex, Option<Led<PF7>>> = Mutex::new(None);
 static SHARED_RED_LED: Mutex<ThreadModeRawMutex, Option<Led<PF8>>> = Mutex::new(None);
 
-const INGRESS_BUF_SIZE: usize = 1024;
-const URC_CAPACITY: usize = 128;
-const URC_SUBSCRIBERS: usize = 3;
-
 bind_interrupts!(struct Irqs {
     LPUART1 => InterruptHandler<peripherals::LPUART1>;
     USART2 => BufferedInterruptHandler<peripherals::USART2>;
-    USART3 => BufferedInterruptHandler<peripherals::USART3>;
     I2C1_EV => i2c::EventInterruptHandler<peripherals::I2C1>;
     I2C1_ER => i2c::ErrorInterruptHandler<peripherals::I2C1>;
 });
-
-#[derive(Clone, AtatResp)]
-pub struct MessageWaitingIndication;
-#[derive(Clone, AtatUrc)]
-pub enum Urc {
-    #[at_urc("+UMWI")]
-    MessageWaitingIndication(MessageWaitingIndication),
-}
-
-#[derive(Clone, Debug, AtatResp)]
-pub struct ManufacturerId {
-    pub id: String<64>,
-}
-
-#[derive(Clone, atat_derive::AtatCmd)]
-#[at_cmd("+CGMI", ManufacturerId)]
-pub struct GetManufacturerId;
 
 #[embassy_executor::task]
 async fn green_led_task() {
@@ -155,6 +132,8 @@ async fn main(spawner: Spawner) {
     });
     let p = embassy_stm32::init(config);
 
+    info!("Hello, World!");
+
     //---------------------------------------------------------------------------------------------
     // Get the LPUART1 an split it in lpuart1tx and lpuart1rx
     let lpuart1 = Uart::new(
@@ -175,29 +154,14 @@ async fn main(spawner: Spawner) {
     // let mut usart2 = Uart::new(p.USART2, p.PD6, p.PD5, Irqs, p.DMA1_CH3, p.DMA1_CH4, UsartConfig::default()).unwrap();
 
     //---------------------------------------------------------------------------------------------
-    // Get the LPUART3 an split it in lpuart3tx and lpuart3rx
-
-    static INGRESS_BUF: StaticCell<[u8; INGRESS_BUF_SIZE]> = StaticCell::new();
-    static TX_BUF: StaticCell<[u8; 16]> = StaticCell::new();
-    static RX_BUF: StaticCell<[u8; 16]> = StaticCell::new();
-
-    let usart3 = BufferedUart::new_with_rtscts(
-        p.USART3,
-        Irqs,
-        p.PD9,  // RX
-        p.PD8,  // TX
-        p.PD12, // RTS
-        p.PD11, // CTS
-        TX_BUF.init([0; 16]),
-        RX_BUF.init([0; 16]),
-        UsartConfig::default(),
-    )
-    .ok()
-    .unwrap();
-    let (usart3tx, usart3rx) = usart3.split();
-
-    // let mut lte_modem =
-    //     lte_modem::LteModem::new(usart3rx, usart3tx, p.PD13.degrade(), p.PD10.degrade());
+    {
+        let mut modem =
+            lte_modem::LteModem::new(p.USART3, p.PD9, p.PD8, p.PD12, p.PD11, p.PD10, p.PD13);
+        modem.hardware_reset().await;
+        Timer::after(Duration::from_millis(100)).await;
+        *(SHARED_LTE_MODEM.lock().await) = Some(modem);
+        spawner.spawn(ingress_task()).unwrap();
+    }
 
     let mut button = ExtiInput::new(Input::new(p.PC13, Pull::None), p.EXTI13);
     {
@@ -205,7 +169,6 @@ async fn main(spawner: Spawner) {
         *(SHARED_BLUE_LED.lock().await) = Some(Led::new(p.PF7));
         *(SHARED_RED_LED.lock().await) = Some(Led::new(p.PF8));
     }
-    info!("Hello, World!");
 
     let mut relays = relay_set::RelaySet::new(I2c::new(
         p.I2C1,
@@ -220,36 +183,20 @@ async fn main(spawner: Spawner) {
 
     // Spawn LED blinking tasks
     spawner.spawn(green_led_task()).unwrap();
-    // spawner.spawn(consume_console_input_task()).unwrap();
-    // spawner.spawn(modem_to_console_task()).unwrap();
 
     // Visual feedback that we are alive
-    set_slow_blink().await;
+    set_fast_blink().await;
 
-    static RES_SLOT: ResponseSlot<INGRESS_BUF_SIZE> = ResponseSlot::new();
-    static URC_CHANNEL: UrcChannel<Urc, URC_CAPACITY, URC_SUBSCRIBERS> = UrcChannel::new();
-    let ingress = Ingress::new(
-        DefaultDigester::<Urc>::default(),
-        INGRESS_BUF.init([0; INGRESS_BUF_SIZE]),
-        &RES_SLOT,
-        &URC_CHANNEL,
-    );
-    static BUF: StaticCell<[u8; 1024]> = StaticCell::new();
-    let mut client = Client::new(
-        usart3tx,
-        &RES_SLOT,
-        BUF.init([0; 1024]),
-        atat::Config::default(),
-    );
-
-    spawner.spawn(ingress_task(ingress, usart3rx)).unwrap();
-    // lte_modem.hardware_reset().await;
-    // lte_modem.test_commands().await;
-    // Spawn reader tasks
-    // spawner.spawn(console_to_modem_task()).unwrap();
+    // {
+    //     let mut lte_modem = SHARED_LTE_MODEM.lock().await;
+    //     let lte_modem = lte_modem.as_mut().unwrap();
+    //     lte_modem.cmd_reset().await;
+    //     info!("ATZ reset");
+    //     lte_modem.test_commands().await;
+    // }
 
     // Visual feedback that we are entering the loop
-    set_fast_blink().await;
+    set_slow_blink().await;
 
     let mut current_relay = 0;
 
@@ -261,31 +208,19 @@ async fn main(spawner: Spawner) {
         current_relay = (current_relay + 1) % 4;
         // lte_modem.send_command("AT+UGZDA?", 10000).await.ok();
         // lte_modem.send_command("AT+UGGLL?", 10000).await.ok();
-
-        let modem_id = client.send(&GetManufacturerId).await.ok();
-        match modem_id {
-            None => {
-                info!("No modem ID");
-            }
-            Some(modem_id) => {
-                info!("Modem ID: {:?}", modem_id.id.as_str());
-            }
-        }
         red_led_off().await;
     }
 }
 
 #[embassy_executor::task]
-async fn ingress_task(
-    mut ingress: Ingress<
-        'static,
-        DefaultDigester<Urc>,
-        Urc,
-        INGRESS_BUF_SIZE,
-        URC_CAPACITY,
-        URC_SUBSCRIBERS,
-    >,
-    mut reader: BufferedUartRx<'static, embassy_stm32::peripherals::USART3>,
-) -> ! {
-    ingress.read_from(&mut reader).await
+async fn ingress_task() -> ! {
+    loop {
+        {
+            let mut lte_modem = SHARED_LTE_MODEM.lock().await;
+            let lte_modem = lte_modem.as_mut().unwrap();
+            trace!("Reading data from modem");
+            lte_modem.do_ingress().await;
+        }
+        Timer::after(Duration::from_millis(100)).await;
+    }
 }

@@ -1,43 +1,124 @@
-use crate::lte_modem::Error::*;
+use atat::asynch::{AtatClient, Client};
+use atat::{AtDigester, AtatIngress, DefaultDigester, Ingress, ResponseSlot, UrcChannel};
+use atat_derive::{AtatResp, AtatUrc};
+use core::fmt::{Debug, Error};
+use defmt::panic;
 use defmt::*;
-use embassy_futures::select::{select, Either};
-use embassy_stm32::gpio::{AnyPin, Level, OutputOpenDrain, Pull, Speed};
-use embassy_stm32::peripherals::{DMA1_CH1, DMA1_CH2, USART3};
-use embassy_stm32::usart::{BufferedUartRx, BufferedUartTx, Error as UartError};
+use embassy_stm32::gpio::{Level, OutputOpenDrain, Pull, Speed};
+use embassy_stm32::peripherals::USART3;
+use embassy_stm32::usart::{
+    BufferedInterruptHandler, BufferedUart, BufferedUartRx, BufferedUartTx,
+};
+use embassy_stm32::{bind_interrupts, peripherals};
 use embassy_time::{Duration, Timer};
+use heapless::String;
+use static_cell::StaticCell;
 
-type UartTxType = BufferedUartTx<'static, USART3>;
-type UartRxType = BufferedUartRx<'static, USART3>;
+const INGRESS_BUF_SIZE: usize = 1024;
+const URC_CAPACITY: usize = 128;
+const URC_SUBSCRIBERS: usize = 3;
 
-pub(crate) struct LteModem {
-    uart_rx: UartRxType,
-    uart_tx: UartTxType,
-    reset_pin: AnyPin,
-    power_pin: AnyPin,
+#[derive(Clone, Debug, AtatResp)]
+pub struct ResetResponse;
+#[derive(Clone, atat_derive::AtatCmd)]
+#[at_cmd("Z", ResetResponse)]
+pub struct Reset;
+
+#[derive(Clone, AtatResp)]
+pub struct MessageWaitingIndication;
+#[derive(Clone, AtatUrc)]
+pub enum Urc {
+    #[at_urc("+UMWI")]
+    MessageWaitingIndication(MessageWaitingIndication),
 }
-pub enum Error {
-    TimeoutError,
-    UartWriteError,
-    UartOverrun,
-    UartNoise,
-    UartFraming,
-    UartParity,
-    AtCommandError,
-    UartReadError,
+
+#[derive(Clone, Debug, AtatResp)]
+pub struct ManufacturerId {
+    pub id: String<64>,
 }
-impl LteModem {
+#[derive(Clone, atat_derive::AtatCmd)]
+#[at_cmd("+CGMI", ManufacturerId)]
+pub struct GetManufacturerId;
+
+type ModemIngress =
+    Ingress<'static, AtDigester<Urc>, Urc, INGRESS_BUF_SIZE, URC_CAPACITY, URC_SUBSCRIBERS>;
+
+type ModemClient = Client<'static, BufferedUartTx<'static, peripherals::USART3>, INGRESS_BUF_SIZE>;
+pub(crate) struct LteModem<'a> {
+    reset_pin: peripherals::PD10,
+    power_pin: peripherals::PD13,
+    usart_rx: BufferedUartRx<'a, USART3>,
+    ingress: ModemIngress,
+    client: ModemClient,
+}
+
+bind_interrupts!(struct Irqs {
+    USART3 => BufferedInterruptHandler<peripherals::USART3>;
+});
+
+impl LteModem<'_> {
     pub(crate) fn new(
-        uart_rx: UartRxType,
-        uart_tx: UartTxType,
-        power_pin: AnyPin,
-        reset_pin: AnyPin,
-    ) -> LteModem {
+        uart: peripherals::USART3,
+        rx_pin: peripherals::PD9,     // RX
+        tx_pin: peripherals::PD8,     // TX
+        rts_pin: peripherals::PD12,   // RTS
+        cts_pin: peripherals::PD11,   // CTS
+        reset_pin: peripherals::PD10, // reset gpio
+        power_pin: peripherals::PD13, // power gpio
+    ) -> LteModem<'static> {
+        static RES_SLOT: ResponseSlot<INGRESS_BUF_SIZE> = ResponseSlot::new();
+        static URC_CHANNEL: UrcChannel<Urc, URC_CAPACITY, URC_SUBSCRIBERS> = UrcChannel::new();
+        static INGRESS_BUF: StaticCell<[u8; INGRESS_BUF_SIZE]> = StaticCell::new();
+
+        static TX_BUF: StaticCell<[u8; 16]> = StaticCell::new();
+        static RX_BUF: StaticCell<[u8; 16]> = StaticCell::new();
+
+        let usart3 = BufferedUart::new_with_rtscts(
+            uart,
+            Irqs,
+            rx_pin,  // RX
+            tx_pin,  // TX
+            rts_pin, // RTS
+            cts_pin, // CTS
+            TX_BUF.init([0; 16]),
+            RX_BUF.init([0; 16]),
+            embassy_stm32::usart::Config::default(),
+        )
+        .ok()
+        .unwrap();
+        let (usart_tx, usart_rx) = usart3.split();
+        let ingress: ModemIngress = Ingress::new(
+            DefaultDigester::<Urc>::default(),
+            INGRESS_BUF.init([0; INGRESS_BUF_SIZE]),
+            &RES_SLOT,
+            &URC_CHANNEL,
+        );
+        static BUF: StaticCell<[u8; INGRESS_BUF_SIZE]> = StaticCell::new();
+        let client = Client::new(
+            usart_tx,
+            &RES_SLOT,
+            BUF.init([0; INGRESS_BUF_SIZE]),
+            atat::Config::default(),
+        );
+
         LteModem {
-            uart_rx,
-            uart_tx,
-            power_pin,
             reset_pin,
+            power_pin,
+            usart_rx,
+            ingress,
+            client,
         }
+    }
+
+    pub(crate) async fn do_ingress(&mut self) {
+        self.ingress.read_from(&mut self.usart_rx).await;
+    }
+
+    pub(crate) async fn cmd_reset(&mut self) {
+        self.client.send(&Reset).await.ok();
+    }
+    pub(crate) async fn cmd_get_manufacturer(&mut self) -> Result<ManufacturerId, atat::Error> {
+        self.client.send(&GetManufacturerId).await
     }
 
     pub(crate) async fn hardware_reset(&mut self) {
@@ -64,52 +145,6 @@ impl LteModem {
         timeout_millis: u32,
     ) -> Result<(), Error> {
         info!("Sending command: {:?}", command);
-        // self.uart_tx
-        //     .write(command.as_bytes())
-        //     .await
-        //     .map_err(|_| UartWriteError)?;
-        // self.uart_tx
-        //     .write(b"\r\n")
-        //     .await
-        //     .map_err(|_| UartWriteError)?;
-        //
-        // let mut buffer = [0u8; 1024];
-        // let timeout = Timer::after(Duration::from_millis(timeout_millis as u64));
-        // let read_future = self.uart_rx.read_until_idle(&mut buffer);
-        //
-        // match select(timeout, read_future).await {
-        //     Either::First(_) => {
-        //         info!("Timeout");
-        //         Err(TimeoutError)
-        //     }
-        //     Either::Second(result) => match result {
-        //         Ok(bytes_read) => {
-        //             let response = &buffer[..bytes_read];
-        //             let string_response = core::str::from_utf8(response).ok().unwrap();
-        //             info!("Response: {}", string_response);
-        //             Ok(())
-        //         }
-        //         Err(UartError::Overrun) => {
-        //             info!("Overrun");
-        //             Err(UartOverrun)
-        //         }
-        //         Err(UartError::Framing) => {
-        //             info!("Framing");
-        //             Err(UartFraming)
-        //         }
-        //         Err(UartError::Noise) => {
-        //             info!("Noise");
-        //             Err(UartNoise)
-        //         }
-        //         Err(UartError::Parity) => {
-        //             info!("Parity");
-        //             Err(UartParity)
-        //         }
-        //         Err(_) => {
-        //             info!("UartReadError");
-        //             Err(UartReadError)
-        //         }
-        //     },
         Ok(())
     }
 
@@ -121,11 +156,19 @@ impl LteModem {
     pub(crate) async fn test_commands(&mut self) {
         info!("Executing startup modem commands");
         trace!("Resetting to known state");
-        self.send_command("ATZ", 50).await.ok();
+        self.cmd_reset().await;
 
         // Print out the modem model
         trace!("Printing modem model");
-        self.send_command("AT+GMM", 50).await.ok();
+        match self.cmd_get_manufacturer().await {
+            Ok(manufacturer) => {
+                let manufacturer = manufacturer.id.as_str();
+                info!("Manufacturer: {:?}", manufacturer);
+            }
+            Err(e) => {
+                info!("Error getting manufacturer id");
+            }
+        }
 
         // Module deregistered from the network but RF circuits are not disabled, hence the
         // radio synchronization is retained
@@ -174,24 +217,6 @@ impl LteModem {
         self.send_command("AT+UGZDA=1", 2000).await.ok();
         // enable GNSS position output
         self.send_command("AT+UGGLL=1", 2000).await.ok();
-        // // configure NMEA output
-        // lte_modem
-        //         .send_command(
-        //             "AT+UGUBX=2,0x06,0x01,0x08,0xF0,0x00,0x01,0x00,0x01,0x01,0x00,0x00,0x00,0x01,0x01",
-        //             2000,
-        //         )
-        //         .await
-        //         .ok();
-        // lte_modem
-        //         .send_command(
-        //             "AT+UGUBX=2,0x06,0x01,0x08,0xF0,0x01,0x01,0x00,0x01,0x01,0x00,0x00,0x00,0x01,0x01",
-        //             2000,
-        //         )
-        //         .await
-        //         .ok();
-        // // Return power indicators
-        // send_command("AT+CIND?", 2000).await.ok();
-        // Return the time based on SARA's clock
         self.send_command("AT+CCLK?", 2000).await.ok();
         // List any files
         self.send_command("AT+ULSTFILE", 2000).await.ok();
